@@ -3,19 +3,31 @@ from discord.ext import commands
 import yt_dlp
 import asyncio
 import os
+import sys
 from collections import deque
 import random
 import time
 from urllib.parse import urlparse, parse_qs
+import logging
 
-# Bot configuration
-TOKEN = 'YOUR_BOT_TOKEN_HERE'
+# Setup logging for Railway
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+# Bot configuration - Get token from environment variable
+TOKEN = os.environ.get('DISCORD_TOKEN') or os.environ.get('BOT_TOKEN')
+if not TOKEN:
+    logger.error("❌ No token found! Please set DISCORD_TOKEN environment variable")
+    sys.exit(1)
+
 PREFIX = '$'
 
 # Intents setup
 intents = discord.Intents.default()
 intents.message_content = True
 intents.voice_states = True
+intents.guilds = True
+intents.members = True
 
 bot = commands.Bot(command_prefix=PREFIX, intents=intents, help_command=None)
 
@@ -33,6 +45,7 @@ class MusicPlayer:
         self.skip_votes = set()
         self.volume = 100
         self.last_activity = time.time()
+        self.requester_id = None
 
     def add_to_queue(self, song_data):
         self.queue.append(song_data)
@@ -70,17 +83,26 @@ ydl_opts = {
     'cookiefile': 'cookies.txt' if os.path.exists('cookies.txt') else None,
 }
 
-# FFmpeg options for streaming
+# FFmpeg options for streaming with Railway optimization
 ffmpeg_options = {
-    'before_options': '-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5',
-    'options': '-vn -b:a 192k -bufsize 64k',
+    'before_options': '-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5 -http_proxy "" -https_proxy ""',
+    'options': '-vn -b:a 192k -bufsize 64k -ar 48000 -ac 2',
 }
 
 async def search_youtube(query, limit=5):
     """Search YouTube for videos matching the query"""
     search_query = f"ytsearch{limit}:{query}"
     
-    with yt_dlp.YoutubeDL({'quiet': True, 'no_warnings': True, 'extract_flat': False}) as ydl:
+    with yt_dlp.YoutubeDL({
+        'quiet': True,
+        'no_warnings': True,
+        'extract_flat': False,
+        'default_search': 'ytsearch',
+        'ignoreerrors': True,
+        'no_check_certificate': True,
+        'socket_timeout': 30,
+        'retries': 3
+    }) as ydl:
         try:
             info = ydl.extract_info(search_query, download=False)
             if info and 'entries' in info:
@@ -97,12 +119,17 @@ async def search_youtube(query, limit=5):
                         })
                 return results
         except Exception as e:
-            print(f"Search error: {e}")
+            logger.error(f"Search error: {e}")
             return None
 
 async def get_video_info(url):
     """Get video information from URL or query"""
-    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+    with yt_dlp.YoutubeDL({
+        **ydl_opts,
+        'socket_timeout': 30,
+        'retries': 3,
+        'extract_flat': False,
+    }) as ydl:
         try:
             info = ydl.extract_info(url, download=False)
             if info and 'entries' in info:
@@ -116,7 +143,7 @@ async def get_video_info(url):
                 'source': 'youtube'
             }
         except Exception as e:
-            print(f"Error getting video info: {e}")
+            logger.error(f"Error getting video info: {e}")
             return None
 
 async def play_song(guild_id):
@@ -159,8 +186,14 @@ async def play_song(guild_id):
             player.is_playing = False
             return
         
-        # Create FFmpeg audio source
-        audio_source = discord.FFmpegPCMAudio(info['url'], **ffmpeg_options)
+        # Create FFmpeg audio source with error handling
+        try:
+            audio_source = discord.FFmpegPCMAudio(info['url'], **ffmpeg_options)
+        except Exception as e:
+            logger.error(f"FFmpeg error: {e}")
+            player.is_playing = False
+            await on_song_end(guild_id, e)
+            return
         
         # Play the audio
         player.voice_client.play(
@@ -171,16 +204,25 @@ async def play_song(guild_id):
         )
         
         # Update volume
-        player.voice_client.source = discord.PCMVolumeTransformer(
-            player.voice_client.source,
-            volume=player.volume / 100
-        )
+        if player.voice_client.source:
+            player.voice_client.source = discord.PCMVolumeTransformer(
+                player.voice_client.source,
+                volume=player.volume / 100
+            )
         
         # Update activity
         player.last_activity = time.time()
         
+        # Update bot status
+        await bot.change_presence(
+            activity=discord.Activity(
+                type=discord.ActivityType.listening,
+                name=f"{song['title'][:50]}"
+            )
+        )
+        
     except Exception as e:
-        print(f"Error playing song: {e}")
+        logger.error(f"Error playing song: {e}")
         player.is_playing = False
         await on_song_end(guild_id, e)
 
@@ -193,7 +235,7 @@ async def on_song_end(guild_id, error=None):
     player.is_playing = False
     
     if error:
-        print(f"Song ended with error: {error}")
+        logger.error(f"Song ended with error: {error}")
     
     # Check if loop is enabled
     if player.loop and player.current_song:
@@ -208,8 +250,15 @@ async def on_song_end(guild_id, error=None):
     if player.queue or (player.loop_queue and player.current_song):
         await play_song(guild_id)
     else:
-        # No more songs, disconnect after idle
-        await bot.loop.create_task(disconnect_after_idle(guild_id))
+        # No more songs, update status
+        await bot.change_presence(
+            activity=discord.Activity(
+                type=discord.ActivityType.listening,
+                name="music | $help"
+            )
+        )
+        # Disconnect after idle
+        asyncio.create_task(disconnect_after_idle(guild_id))
 
 async def disconnect_after_idle(guild_id):
     """Disconnect after idle timeout"""
@@ -224,6 +273,12 @@ async def disconnect_after_idle(guild_id):
             await player.voice_client.disconnect()
         if guild_id in players:
             del players[guild_id]
+        await bot.change_presence(
+            activity=discord.Activity(
+                type=discord.ActivityType.listening,
+                name="music | $help"
+            )
+        )
 
 # Commands
 
@@ -242,11 +297,12 @@ async def play(ctx, *, query):
         players[guild_id] = MusicPlayer(guild_id)
     
     player = players[guild_id]
+    player.requester_id = ctx.author.id
     
     # Connect to voice channel
     if not player.voice_client or not player.voice_client.is_connected():
         try:
-            player.voice_client = await voice_channel.connect()
+            player.voice_client = await voice_channel.connect(timeout=10, reconnect=True)
         except Exception as e:
             await ctx.send(f"❌ Failed to connect: {str(e)}")
             return
@@ -285,6 +341,7 @@ async def play(ctx, *, query):
             await play_song(guild_id)
             
     except Exception as e:
+        logger.error(f"Play error: {e}")
         await status_msg.edit(content=f"❌ Error: {str(e)}")
 
 @bot.command(name='search')
@@ -345,10 +402,11 @@ async def search(ctx, *, query):
                     players[guild_id] = MusicPlayer(guild_id)
                 
                 player = players[guild_id]
+                player.requester_id = ctx.author.id
                 
                 # Connect to voice channel
                 if not player.voice_client or not player.voice_client.is_connected():
-                    player.voice_client = await voice_channel.connect()
+                    player.voice_client = await voice_channel.connect(timeout=10, reconnect=True)
                 
                 # Add to queue
                 player.add_to_queue(song)
@@ -385,14 +443,12 @@ async def skip(ctx):
         await ctx.send("❌ You need to be in a voice channel!")
         return
     
-    # Skip voting (3 votes needed for others, 1 for the requester)
-    if player.current_song and ctx.author.id != 0:  # You can add requester ID check
-        # Simple skip without voting (like Lara Bot)
-        if player.voice_client:
-            player.voice_client.stop()
-            await ctx.send("⏭️ Skipped the current song!")
-        else:
-            await ctx.send("❌ No audio is playing!")
+    # Skip without voting (like Lara Bot)
+    if player.voice_client:
+        player.voice_client.stop()
+        await ctx.send("⏭️ Skipped the current song!")
+    else:
+        await ctx.send("❌ No audio is playing!")
 
 @bot.command(name='queue', aliases=['q'])
 async def queue(ctx):
@@ -483,6 +539,13 @@ async def stop(ctx):
         player.current_song = None
     
     player.clear_queue()
+    
+    await bot.change_presence(
+        activity=discord.Activity(
+            type=discord.ActivityType.listening,
+            name="music | $help"
+        )
+    )
     
     await ctx.send("⏹️ Stopped playback and cleared queue!")
 
@@ -787,6 +850,13 @@ async def leave(ctx):
     
     if guild_id in players:
         del players[guild_id]
+    
+    await bot.change_presence(
+        activity=discord.Activity(
+            type=discord.ActivityType.listening,
+            name="music | $help"
+        )
+    )
 
 @bot.command(name='invite')
 async def invite(ctx):
@@ -806,12 +876,20 @@ async def invite(ctx):
 # Event handlers
 @bot.event
 async def on_ready():
-    print(f'🤖 Bot is ready!')
-    print(f'📊 Connected as: {bot.user.name}')
-    print(f'🔢 Bot ID: {bot.user.id}')
-    print(f'📝 Prefix: {PREFIX}')
-    print(f'🎵 Music commands loaded!')
-    print('-' * 50)
+    logger.info(f'🤖 Bot is ready!')
+    logger.info(f'📊 Connected as: {bot.user.name}')
+    logger.info(f'🔢 Bot ID: {bot.user.id}')
+    logger.info(f'📝 Prefix: {PREFIX}')
+    logger.info(f'🎵 Music commands loaded!')
+    logger.info('-' * 50)
+    
+    # Set status
+    await bot.change_presence(
+        activity=discord.Activity(
+            type=discord.ActivityType.listening,
+            name="music | $help"
+        )
+    )
 
 @bot.event
 async def on_command_error(ctx, error):
@@ -826,7 +904,7 @@ async def on_command_error(ctx, error):
         await ctx.send(f"❌ Invalid argument! Use `{PREFIX}help` for more info.")
         return
     
-    print(f"Error: {error}")
+    logger.error(f"Command error: {error}")
     await ctx.send(f"❌ An error occurred: {str(error)}")
 
 @bot.event
@@ -860,9 +938,13 @@ async def on_voice_state_update(member, before, after):
                         await player.voice_client.disconnect()
                         del players[guild_id]
 
-# Run the bot
+# Run the bot with proper error handling
 if __name__ == "__main__":
-    if TOKEN == 'YOUR_BOT_TOKEN_HERE':
-        print("❌ Please add your bot token to the TOKEN variable!")
-    else:
-        bot.run(TOKEN)
+    try:
+        bot.run(TOKEN, reconnect=True)
+    except discord.LoginFailure as e:
+        logger.error(f"❌ Login failed! Invalid token: {e}")
+        sys.exit(1)
+    except Exception as e:
+        logger.error(f"❌ Fatal error: {e}")
+        sys.exit(1)
