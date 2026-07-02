@@ -9,28 +9,31 @@ import random
 import time
 from urllib.parse import urlparse
 import logging
-import json
+import subprocess
 
 # ============================================
-# CONFIGURATION & SETUP
+# FORCE INSTALL DEPENDENCIES FOR RAILWAY
 # ============================================
 
-# Force install dependencies if missing
 try:
     import nacl
 except ImportError:
-    import subprocess
+    print("📦 Installing PyNaCl...")
     subprocess.check_call([sys.executable, "-m", "pip", "install", "PyNaCl>=1.5.0"])
     import nacl
 
-# Setup logging
+# ============================================
+# CONFIGURATION
+# ============================================
+
+# Setup logging for Railway
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(levelname)s - %(message)s'
 )
 logger = logging.getLogger(__name__)
 
-# Bot configuration
+# Bot configuration - Get token from environment variable
 TOKEN = os.environ.get('DISCORD_TOKEN') or os.environ.get('BOT_TOKEN')
 if not TOKEN:
     logger.error("❌ No token found! Set DISCORD_TOKEN environment variable")
@@ -347,7 +350,7 @@ async def update_bot_status(guild_id, idle=False):
         await bot.change_presence(
             activity=discord.Activity(
                 type=discord.ActivityType.listening,
-                name="🎵 music | $help"
+                name="🎵 $help | Music Bot"
             )
         )
         return
@@ -358,7 +361,7 @@ async def update_bot_status(guild_id, idle=False):
         await bot.change_presence(
             activity=discord.Activity(
                 type=discord.ActivityType.listening,
-                name="🎵 music | $help"
+                name="🎵 $help | Music Bot"
             )
         )
     elif player.current:
